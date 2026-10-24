@@ -1,0 +1,220 @@
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: boucio-otel-collector
+  namespace: opentelemetry
+spec:
+  mode: daemonset
+  hostNetwork: true
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8889"
+  # DATADOG-PAID: DD_API_KEY is only consumed by the (commented) Datadog exporter below.
+  # Uncomment this env together with that exporter when moving to paid Datadog.
+  # env:
+  #   - name: DD_API_KEY
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: datadog-secret
+  #         key: api-key
+  image: otel/opentelemetry-collector-contrib:0.127.0
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_binary:
+            endpoint: 0.0.0.0:6832
+          thrift_compact:
+            endpoint: 0.0.0.0:6831
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+      zipkin:
+        endpoint: 0.0.0.0:9411
+      hostmetrics:
+        collection_interval: 10s
+        scrapers:
+          cpu: {}
+          disk: {}
+          filesystem: {}
+          load: {}
+          memory: {}
+          network: {}
+          paging: {}
+          process: {}
+          processes: {}
+      kubeletstats:
+        collection_interval: 10s
+        auth_type: serviceAccount
+        # $$ escapes the var so Flux's postBuild substitution leaves it for the collector to
+        # expand at runtime (single $ would be replaced/emptied by Flux).
+        endpoint: https://$${K8S_NODE_NAME}:10250
+        insecure_skip_verify: true
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 1500
+        spike_limit_mib: 512
+      resource:
+        attributes:
+          - key: environment
+            # Resolved by Flux from the cluster-vars ConfigMap (single $ = Flux-substituted).
+            value: "${ENVIRONMENT_ID}"
+            action: upsert
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.namespace.name
+            - k8s.node.name
+            - k8s.pod.start_time
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 100
+        expected_new_traces_per_sec: 10
+        policies:
+          - name: latency-policy
+            type: latency
+            latency:
+              threshold_ms: 100
+          - name: error-policy
+            type: status_code
+            status_code:
+              status_codes: ["ERROR", "OK"]
+
+    exporters:
+      # DATADOG-PAID: uncomment to route signals to Datadog (paid APM / Logs), and re-add `otlp`
+      # to the pipeline exporter lists below. $$ keeps the key for the collector (not Flux).
+      # otlp:
+      #   endpoint: "https://trace.agent.datadoghq.com:443"
+      #   headers:
+      #     "dd-api-key": "$${DD_API_KEY}"
+      otlp/jaeger:
+        endpoint: "jaeger-v2-collector.opentelemetry.svc.cluster.local:4317"
+        tls:
+          insecure: true
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        namespace: otel
+        send_timestamps: true
+        metric_expiration: 180m
+        resource_to_telemetry_conversion:
+          enabled: true
+      # Temporary sink so the logs pipeline stays valid until a durable log store exists.
+      # Swap for a real exporter (e.g. Loki, or uncomment the Datadog otlp exporter) to make
+      # logs durable — see OBSERVABILITY_DESIGN.md §8.
+      debug:
+        verbosity: normal
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      pprof:
+        endpoint: 0.0.0.0:1777
+      zpages:
+        endpoint: 0.0.0.0:55679
+
+    service:
+      extensions: [health_check, pprof, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp, jaeger, zipkin]
+          processors:
+            [memory_limiter, batch, resource, k8sattributes, tail_sampling]
+          # DATADOG-PAID: add `otlp` back to also export traces to Datadog APM.
+          exporters: [otlp/jaeger]
+        metrics:
+          receivers: [otlp, hostmetrics, kubeletstats]
+          processors: [memory_limiter, batch, resource, k8sattributes]
+          # DATADOG-PAID: add `otlp` back to also export metrics to Datadog.
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch, resource, k8sattributes]
+          # Logs are received but not stored durably yet — `debug` keeps the pipeline valid.
+          # DATADOG-PAID: replace `debug` with `otlp` to route logs to Datadog Logs.
+          exporters: [debug]
+---
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: jaeger-v2
+  namespace: opentelemetry
+spec:
+  image: jaegertracing/jaeger:2.14.0
+  mode: deployment
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8888"
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  config:
+    extensions:
+      jaeger_storage:
+        backends:
+          local_memory:
+            memory:
+              max_traces: 10000
+      jaeger_query:
+        storage:
+          traces: local_memory
+        http:
+          endpoint: 0.0.0.0:16686
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch: {}
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: local_memory
+    service:
+      extensions: [jaeger_storage, jaeger_query]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-v2-nodeport
+  namespace: opentelemetry
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/component: opentelemetry-collector
+    app.kubernetes.io/instance: opentelemetry.jaeger-v2
+  ports:
+    - name: jaeger-ui
+      port: 16686
+      targetPort: 16686
+      nodePort: 30686
+    - name: jaeger-query-grpc
+      port: 16685
+      targetPort: 16685

@@ -1,0 +1,2 @@
+# Sandbox cluster domain override
+clusterDomain: ${CLUSTER_DOMAIN}
